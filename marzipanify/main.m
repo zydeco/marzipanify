@@ -6,10 +6,31 @@
 //  Copyright © 2018 Steven Troughton-Smith. All rights reserved.
 //
 
+#define PLATFORM_IOSMAC 6
+
 @import Foundation;
 @import ObjectiveC.runtime;
 @import MachO;
 @import vmnet;
+
+@implementation NSData (LoadCommand)
+- (uint32_t)loadCommand {
+    struct load_command *cmd = (struct load_command*)self.bytes;
+    return cmd->cmd;
+}
+
+- (NSString*)loadCommandDylibName {
+    struct dylib_command *cmd = (struct dylib_command*)self.bytes;
+    NSUInteger offset = cmd->dylib.name.offset;
+    NSUInteger maxSize = self.length - offset;
+    char *name = calloc(maxSize + 1, 1);
+    memcpy(name, self.bytes + offset, maxSize);
+    NSString *string = [NSString stringWithUTF8String:name];
+    free(name);
+    return string;
+}
+
+@end
 
 #define DEBUG_PRINT_COMMANDLINE 0
 #define PRINT_LIBSWIFT_LINKER_ERRORS 0
@@ -231,123 +252,94 @@ NSArray *modifyMachHeaderAndReturnNSArrayOfLoadedDylibs(NSString *binaryPath)
 		return @[];
 	}
 	
-	const struct fat_header *header_fat = (struct fat_header *)macho;
 	uint8_t *imageHeaderPtr = (uint8_t*)macho;
-	
-	long header64offset = 0;
-
-	if (header_fat->magic == FAT_CIGAM || header_fat->magic == FAT_MAGIC)
-	{
-		int narchs = OSSwapBigToHostInt32(header_fat->nfat_arch);
-		imageHeaderPtr += sizeof(header_fat);
-
-		for (int i = 0; i < narchs; i++)
-		{
-			struct fat_arch uarch = *(struct fat_arch*)imageHeaderPtr;
-			
-			if (OSSwapBigToHostInt32(uarch.cputype) == CPU_TYPE_X86_64)
-			{
-				//printf("mach_header_64 offset = %u\n", OSSwapBigToHostInt32(uarch.offset));
-				header64offset = OSSwapBigToHostInt32(uarch.offset) -32 + sizeof(struct mach_header_64);
-				break;
-			}
-			else if (OSSwapBigToHostInt32(uarch.cputype) == CPU_TYPE_ARM64)
-			{
-				//printf("mach_header_64 offset = %u\n", OSSwapBigToHostInt32(uarch.offset));
-				header64offset = OSSwapBigToHostInt32(uarch.offset) -32 + sizeof(struct mach_header_64);
-				break;
-			}
-			else
-				imageHeaderPtr += sizeof(struct fat_arch);
-		}
-		
-		if (header64offset == 0)
-		{
-			printf("ERROR: No X86_64 or ARM64 slice found.\n");
-			exit(-1);
-		}
-	}
-
-	imageHeaderPtr = (uint8_t*)(macho+header64offset);
-	
 	typedef struct load_command load_command;
-	const struct mach_header_64 *header64 = (struct mach_header_64 *)imageHeaderPtr;
+    struct mach_header_64 *header64 = (struct mach_header_64 *)imageHeaderPtr;
 	
-	if (header64->magic != MH_MAGIC_64)
-		return @[];
-
+    if (header64->magic != MH_MAGIC_64) {
+        printf("Invalid magic, try thinning the binary\n");
+        exit(-1);
+    }
+    
+    if (header64->cputype == CPU_TYPE_ARM64) {
+        printf("Changing architecture\n");
+        if (!DRY_RUN) {
+            header64->cputype = CPU_TYPE_X86_64;
+            uint32_t subtype_features = header64->cpusubtype & CPU_SUBTYPE_MASK;
+            header64->cpusubtype = subtype_features | CPU_SUBTYPE_X86_64_ALL;
+            // remove PIE
+            header64->flags &= ~MH_PIE;
+            // mark emulatable
+            header64->reserved = 0x456D400C;
+        }
+    } else {
+        printf("Not an arm64 binary (0x%x)\n", header64->cputype);
+        exit(-1);
+    }
+    
 	imageHeaderPtr += sizeof(struct mach_header_64);
-	load_command *command = (load_command*)(imageHeaderPtr);
-
+    
+    // read all load commands
+    NSMutableArray *loadCommands = [NSMutableArray new];
 	for(int i = 0; i < header64->ncmds > 0; ++i)
 	{
-		if(command->cmd == LC_LOAD_DYLIB)
+        load_command *command = (load_command*)(imageHeaderPtr);
+        NSMutableData *commandData = [NSMutableData dataWithBytes:command length:command->cmdsize];
+        [loadCommands addObject:commandData];
+        imageHeaderPtr += command->cmdsize;
+    }
+    
+    // find dylibs
+    for (NSMutableData *commandData in loadCommands)
+    {
+        if ([commandData loadCommand] == LC_LOAD_DYLIB || [commandData loadCommand] == LC_LOAD_WEAK_DYLIB)
 		{
-			struct dylib_command ucmd = *(struct dylib_command*)imageHeaderPtr;
-			int offset = ucmd.dylib.name.offset;
-			int size = ucmd.cmdsize;
-			
-			char *name = (char *)malloc(size);
-			memset(name, 0, size);
-			
-			strncpy(name, (char *)(imageHeaderPtr+offset), (size));
-			
-			//printf("LC_LOAD_DYLIB %s\n", name);
-			[dylibs addObject:[NSString stringWithUTF8String:name]];
+            NSString *dylibName = [commandData loadCommandDylibName];
+			printf("LC_LOAD_DYLIB “%s”\n", dylibName.UTF8String);
+			[dylibs addObject:dylibName];
 		}
-		else if(command->cmd == LC_VERSION_MIN_IPHONEOS)
-		{
-			if ([binaryPath.lastPathComponent hasPrefix:@"libswift"])
-			{
-#if PRINT_LIBSWIFT_LINKER_ERRORS
-				printf("ERROR: This bundle contains an incompatible version of the Swift standard libraries (%s).\n", binaryPath.UTF8String);
-				
-				static dispatch_once_t onceToken;
-				dispatch_once(&onceToken, ^{
-					printf("\nNOTE: An iOSMac set of the most-recent Swift standard libraries can be found at /System/Library/PrivateFrameworks/Swift. If your app uses a compatible version of Swift, these libraries may be used in place of those included with your build. Alternatively, you can hardcode the existing embedded library paths in /System/iOSSupport/dyld/macOS-whitelist.txt to allow this app to load the non-iOSMac libraries.\n\n");
-				});
-#endif
-			}
-			else
-			{
-				if (INJECT_MARZIPAN_GLUE)
-				{
-					printf("WARNING: This binary (%s) was built with an earlier iOS SDK.\n", binaryPath.lastPathComponent.UTF8String);
-				}
-				else
-				{
-					printf("ERROR: This binary (%s) was built with an earlier iOS SDK. As of macOS 10.14 beta 3, it needs to be rebuilt with a minimum deployment target of iOS 12.\n", binaryPath.lastPathComponent.UTF8String);
-					
-					static dispatch_once_t onceToken;
-					dispatch_once(&onceToken, ^{
-						printf("\nNOTE: iOSMac binaries require the LC_BUILD_VERSION load command to be present. This is added automatically by the linker when the minimum deployment target is iOS 12.0 or macOS 10.14, and cannot be added to existing binaries for older OSes. Use the INJECT_MARZIPAN_GLUE=1 environment variable to use code injection to attempt to work around this.\n\n");
-					});
-				}
-			}
-			
-			struct version_min_command ucmd = *(struct version_min_command*)imageHeaderPtr;
-			ucmd.cmd = LC_VERSION_MIN_MACOSX;
-			ucmd.sdk = 10<<16|14<<8|0;
-			ucmd.version = 10<<16|14<<8|0;
-			
-			if (!DRY_RUN)
-				memcpy(imageHeaderPtr, &ucmd, ucmd.cmdsize);
-		}
-		else if(command->cmd == LC_BUILD_VERSION)
-		{
-			struct build_version_command ucmd = *(struct build_version_command*)imageHeaderPtr;
-			ucmd.platform = PLATFORM_IOSMAC;
-			ucmd.minos = 12<<16|0<<8|0;
-			ucmd.sdk = 10<<16|14<<8|0;
-			
-			if (!DRY_RUN)
-				memcpy(imageHeaderPtr, &ucmd, ucmd.cmdsize);
-		}
-		
-		imageHeaderPtr += command->cmdsize;
-		command = (load_command*)imageHeaderPtr;
 	}
-	
+    
+    // replace LC_VERSION_MIN_IPHONEOS with LC_BUILD_VERSION, or update LC_BUILD_VERSION
+    NSUInteger buildVersionIndex = [loadCommands indexOfObjectPassingTest:^BOOL(NSData * _Nonnull lc, NSUInteger idx, BOOL * _Nonnull stop) {
+        return lc.loadCommand == LC_BUILD_VERSION;
+    }];
+    NSMutableData *buildVersionData = [NSMutableData dataWithLength:sizeof(struct build_version_command) + sizeof(struct build_tool_version)];
+    struct build_version_command *buildVersionCmd = (struct build_version_command*)buildVersionData.mutableBytes;
+    buildVersionCmd->cmd = LC_BUILD_VERSION;
+    buildVersionCmd->cmdsize = (uint32_t)buildVersionData.length;
+    buildVersionCmd->platform = PLATFORM_IOSMAC;
+    buildVersionCmd->minos = 12<<16|0<<8|0;
+    buildVersionCmd->sdk = 10<<16|14<<8|0;
+    buildVersionCmd->ntools = 1;
+    struct build_tool_version *buildVersionTool = (struct build_tool_version*)(buildVersionData.mutableBytes + sizeof(struct build_version_command));
+    buildVersionTool[0].tool = TOOL_LD;
+    buildVersionTool[0].version = 0x2000100;
+    if (buildVersionIndex == NSNotFound) {
+        buildVersionIndex = [loadCommands indexOfObjectPassingTest:^BOOL(NSData * _Nonnull lc, NSUInteger idx, BOOL * _Nonnull stop) {
+            return lc.loadCommand == LC_VERSION_MIN_IPHONEOS;
+        }];
+        if (buildVersionIndex == NSNotFound) {
+            printf("No LC_BUILD_VERSION or LC_VERSION_MIN_IPHONEOS, what do?\n");
+            exit(-1);
+        }
+        printf("Replacing LC_VERSION_MIN_IPHONEOS with LC_BUILD_VERSION\n");
+    }
+    if (!DRY_RUN) {
+        [loadCommands replaceObjectAtIndex:buildVersionIndex withObject:buildVersionData];
+    }
+    
+    // write new load commands
+    NSMutableData *allLoadCommands = [NSMutableData dataWithCapacity:header64->sizeofcmds];
+    for (NSData *loadCommand in loadCommands) {
+        [allLoadCommands appendData:loadCommand];
+    }
+    if (!DRY_RUN) {
+        header64->ncmds = (uint32_t)loadCommands.count;
+        header64->sizeofcmds = (uint32_t)allLoadCommands.length;
+        // TODO: check that there's space available
+        memcpy(macho+sizeof(struct mach_header_64), allLoadCommands.bytes, allLoadCommands.length);
+    }
 	msync(macho, sz, MS_SYNC);
 	
 	munmap(macho, sz);
